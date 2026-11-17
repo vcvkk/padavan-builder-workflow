@@ -1,0 +1,71 @@
+                                        <tr id="row_tgwsp">
+                                            <th width="50%"><a class="help_tooltip" href="javascript:void(0);" title="<#TgWsp_desc#>"><#TgWsp#></a></th>
+                                            <td>
+                                                <div class="main_itoggle">
+                                                    <div id="tgwsp_enable_on_of">
+                                                        <input type="checkbox" id="tgwsp_enable_fake" <% nvram_match_x("", "tgwsp_enable", "1", "value=1 checked"); %><% nvram_match_x("", "tgwsp_enable", "0", "value=0"); %>>
+                                                    </div>
+                                                </div>
+                                                <div style="position: absolute; margin-left: -10000px;">
+                                                    <input type="radio" name="tgwsp_enable" id="tgwsp_enable_1" class="input" value="1" <% nvram_match_x("", "tgwsp_enable", "1", "checked"); %>/><#checkbox_Yes#>
+                                                    <input type="radio" name="tgwsp_enable" id="tgwsp_enable_0" class="input" value="0" <% nvram_match_x("", "tgwsp_enable", "0", "checked"); %>/><#checkbox_No#>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                        <tr id="row_tgwsp_service" style="display:none">
+                                            <td colspan="2" style="padding: 0; border: 0;">
+                                                <table height="100%" width="100%" cellpadding="0" cellspacing="0" class="table" style="border: 0px; margin: 0px;">
+                                                    <tr>
+                                                        <td colspan="2"><span style="color:#888;"><#TgWsp_desc#></span></td>
+                                                    </tr>
+                                                    <tr>
+                                                        <th width="50%"><#TgWsp_ipv6#>:</th>
+                                                        <td>
+                                                            <select name="tgwsp_ipv6" class="input">
+                                                                <option value="1" <% nvram_match_x("", "tgwsp_ipv6", "1","selected"); %>><#CTL_Enabled#> (*)</option>
+                                                                <option value="0" <% nvram_match_x("", "tgwsp_ipv6", "0","selected"); %>><#CTL_Disabled#></option>
+                                                            </select>
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <th><#TgWsp_log#>:</th>
+                                                        <td>
+                                                            <select name="tgwsp_log" class="input">
+                                                                <option value="0" <% nvram_match_x("", "tgwsp_log", "0","selected"); %>><#CTL_Disabled#></option>
+                                                                <option value="1" <% nvram_match_x("", "tgwsp_log", "1","selected"); %>><#CTL_Enabled#></option>
+                                                            </select>
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <th><#TgWsp_args#>:</th>
+                                                        <td>
+                                                            <input type="text" maxlength="512" class="input" size="32" name="tgwsp_args" value="<% nvram_get_x("", "tgwsp_args"); %>" onkeypress="return is_string(this,event);" placeholder="--default-domains"/>
+                                                        </td>
+                                                    </tr>
+                                                    <tr>
+                                                        <th style="border-bottom: 0 none;"><#TgWsp_link#>:</th>
+                                                        <td style="border-bottom: 0 none;">
+                                                            <input type="text" readonly class="input" size="32" id="tgwsp_link" value="" onclick="this.select();"/>
+                                                        </td>
+                                                    </tr>
+                                                </table>
+                                                <script>
+                                                function change_tgwsp_enabled(){
+                                                    showhide_div('row_tgwsp_service', document.form.tgwsp_enable[0].checked);
+                                                }
+                                                $j(document).ready(function() {
+                                                    if (!found_app_tgwsp()) {
+                                                        showhide_div('row_tgwsp', 0);
+                                                        showhide_div('row_tgwsp_service', 0);
+                                                        return;
+                                                    }
+                                                    init_itoggle('tgwsp_enable', change_tgwsp_enabled);
+                                                    change_tgwsp_enabled();
+                                                    var secret = "<% nvram_get_x("", "tgwsp_secret"); %>";
+                                                    document.getElementById('tgwsp_link').value = secret.length == 32
+                                                        ? "tg://proxy?server=<% nvram_get_x("", "lan_ipaddr"); %>&port=1443&secret=dd" + secret
+                                                        : "-";
+                                                });
+                                                </script>
+                                            </td>
+                                        </tr>

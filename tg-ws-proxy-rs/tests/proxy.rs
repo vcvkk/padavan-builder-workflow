@@ -1,0 +1,990 @@
+use std::time::Duration;
+
+use clap::Parser;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::crypto::{ProtoTag, generate_client_handshake};
+use tg_ws_proxy_rs::faketls::{
+    TLS_MAX_RECORD_PAYLOAD, build_faketls_client_hello, drain_faketls_server_hello,
+    sign_faketls_client_hello, write_tls_appdata,
+};
+use tg_ws_proxy_rs::proxy::split_mtproto_init_and_pending;
+
+mod common;
+
+use common::{
+    await_proxy_handler, await_proxy_request, await_proxy_requests, rejecting_http_proxy,
+    rejecting_http_proxy_requests, run_proxy_once, run_proxy_once_for_dc,
+    stalling_http_proxy_requests, start_proxy_connection,
+};
+
+const SECRET: &str = "00112233445566778899aabbccddeeff";
+
+// The upstream-failure cooldown is a process-global map keyed by `host:port`,
+// and every test in this binary shares it. Tests that need the upstream tier
+// to actually be attempted therefore each use their own hostname, so a
+// sibling test failing its upstream cannot make this one skip the tier and
+// fall through to TCP instead.
+const UPSTREAM_FULL_RECORD: &str = "upstream-full-record.example";
+const UPSTREAM_OVERSIZED: &str = "upstream-oversized.example";
+
+// ─── Inbound handshake framing ───────────────────────────────────────────────
+
+#[test]
+fn split_mtproto_init_keeps_coalesced_appdata_payload() {
+    // Some clients send the MTProto init and the first payload in the same TLS
+    // AppData record; the listener must preserve the extra bytes.
+    let mut data = Vec::new();
+    data.extend(0u8..64);
+    data.extend_from_slice(b"first payload bytes");
+
+    let (handshake, pending) =
+        split_mtproto_init_and_pending(&data).expect("coalesced init + payload");
+
+    assert_eq!(handshake, core::array::from_fn(|i| i as u8));
+    assert_eq!(pending, b"first payload bytes");
+}
+
+#[test]
+fn split_mtproto_init_accepts_exactly_64_bytes() {
+    // The normal case is exactly one 64-byte MTProto obfuscation init packet.
+    let data: Vec<u8> = (0u8..64).collect();
+
+    let (handshake, pending) = split_mtproto_init_and_pending(&data).expect("exact init");
+
+    assert_eq!(handshake, core::array::from_fn(|i| i as u8));
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn split_mtproto_init_rejects_short_input() {
+    // Less than 64 bytes cannot be a complete MTProto obfuscation init.
+    let data: Vec<u8> = (0u8..63).collect();
+
+    assert!(split_mtproto_init_and_pending(&data).is_none());
+    assert!(split_mtproto_init_and_pending(&[]).is_none());
+}
+
+#[tokio::test]
+async fn a_wrong_secret_is_drained_without_closing_the_connection() {
+    // A scanner must not learn anything from when the connection ends: after
+    // a bad handshake the listener reads and discards, sending no FIN even
+    // past the handshake timeout, until the client gives up.
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        SECRET,
+        "--handshake-timeout",
+        "1",
+        "--no-outbound-proxy",
+    ])
+    .unwrap();
+    let (mut client, handler) = start_proxy_connection(config).await;
+    client.write_all(&[0x5a; 64]).await.unwrap();
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_millis(1500), client.read(&mut byte)).await;
+    assert!(read.is_err(), "the listener answered or closed: {read:?}");
+    assert!(!handler.is_finished());
+
+    drop(client);
+    await_proxy_handler(handler).await;
+}
+
+// ─── Fallback chain ──────────────────────────────────────────────────────────
+
+/// Build a serving (non-`--check`) config routed through `proxy_addr`, with
+/// environment proxy discovery disabled so the host's own `HTTPS_PROXY` /
+/// `NO_PROXY` cannot influence the test.
+fn proxy_config(proxy_addr: &str, extra: &[&str]) -> Config {
+    let mut args = vec![
+        "tg-ws-proxy",
+        "--secret",
+        SECRET,
+        "--outbound-proxy",
+        proxy_addr,
+        "--no-outbound-proxy",
+        "--no-proxy",
+        "",
+        "--handshake-timeout",
+        "2",
+        "--cf-connect-timeout",
+        "2",
+        "--upstream-connect-timeout",
+        "2",
+        "--tcp-fallback-timeout",
+        "2",
+    ];
+    args.extend_from_slice(extra);
+
+    Config::try_parse_from(args).unwrap()
+}
+
+/// The `CONNECT` targets a fallback chain asked the outbound proxy for, in
+/// order — the observable shape of the ladder.
+fn connect_targets(requests: &[String]) -> Vec<&str> {
+    requests
+        .iter()
+        .filter_map(|request| request.split_whitespace().nth(1))
+        .collect()
+}
+
+#[tokio::test]
+async fn proxy_upstream_fallback_uses_outbound_proxy() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &["--mtproto-proxy", &format!("upstream.example:443:{SECRET}")],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("CONNECT upstream.example:443 HTTP/1.1")),
+        "expected upstream fallback CONNECT, got {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_tcp_fallback_uses_outbound_proxy() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    let config = proxy_config(&format!("http://{proxy_addr}"), &[]);
+
+    run_proxy_once(config).await;
+
+    // No --dc-ip and no CF/upstream tiers configured, so DC 2 falls straight
+    // through to its built-in fallback IP.
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1"));
+}
+
+#[tokio::test]
+async fn cf_proxy_is_retried_fresh_on_every_connection_no_cooldown() {
+    // Regression test for issue #81: a per-DC cooldown used to block *every*
+    // CF domain for a DC after a single failed attempt, so with
+    // --cf-balance/--default-domains (many domains) one flaky domain could
+    // knock out CF entirely for --cf-fail-cooldown seconds, forcing every
+    // connection in that window straight to the (often doomed) TCP fallback.
+    // Upstream tg-ws-proxy's `_cfproxy_fallback` has no such cooldown at
+    // all — every connection retries every configured domain fresh — so we
+    // now match that. With one CF domain configured (its kwsN record tried
+    // twice) and no --dc-ip/upstream-proxy, each of 2 separate client
+    // connections should independently try both CF attempts before falling
+    // through to TCP: 3 CONNECTs per connection, 6 total.
+    // The old cooldown-gated behavior would only produce 4 (connection 2
+    // skips CF and goes straight to its single TCP-fallback attempt).
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &["--cf-domain", "example.net"],
+        )
+    };
+
+    run_proxy_once(make_config()).await;
+    run_proxy_once(make_config()).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        requests.len(),
+        6,
+        "expected both connections to retry CF fresh (2 CF attempts + TCP \
+         fallback each), got {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn cf_tiers_use_plaintext_without_changing_the_tcp_fallback() {
+    // The Python fallback order for a DC without --dc-ip is Worker, then CF
+    // proxy, then TCP: 1 + 2 + 1 = 4 CONNECTs.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-worker-domain",
+            "worker.example.dev",
+            "--cf-domain",
+            "example.net",
+            "--cf-disable-tls",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            "worker.example.dev:80",
+            "kws2.example.net:80",
+            "kws2.example.net:80",
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+// ─── Pinned per-class upstream order ─────────────────────────────────────────
+
+#[tokio::test]
+async fn pinned_media_upstream_bypasses_cf_for_media_connections() {
+    // A media handshake carries a negative DC index, and --pinned-media-upstream
+    // owns its ladder: with `tcp` pinned, the configured CF tier must not even
+    // be attempted for a media connection.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "media-pin.example.net",
+            "--pinned-media-upstream",
+            "tcp",
+        ],
+    );
+
+    run_proxy_once_for_dc(config, -2).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(connect_targets(&requests), ["149.154.167.51:443"]);
+}
+
+#[tokio::test]
+async fn pinned_media_upstream_leaves_non_media_connections_on_the_default_ladder() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-worker-domain",
+            "worker-medpin.example.dev",
+            "--cf-domain",
+            "medpin.example.net",
+            "--pinned-media-upstream",
+            "tcp",
+        ],
+    );
+
+    // DC 2 with a positive index: non-media, so the default order applies —
+    // Worker, both CF domain variants, then the TCP fallback.
+    run_proxy_once_for_dc(config, 2).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            "worker-medpin.example.dev:443",
+            "kws2.medpin.example.net:443",
+            "kws2.medpin.example.net:443",
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn media_connections_inherit_a_non_media_only_pin() {
+    // --pinned-upstream without --pinned-media-upstream must pin media too:
+    // letting media slip back to the default ladder would undo the egress
+    // decision the operator made with the single flag.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "inherit.example.net",
+            "--pinned-upstream",
+            "tcp",
+        ],
+    );
+
+    run_proxy_once_for_dc(config, -2).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(connect_targets(&requests), ["149.154.167.51:443"]);
+}
+
+#[tokio::test]
+async fn pinned_upstream_reorders_the_ladder_for_non_media_connections() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-worker-domain",
+            "worker-pin.example.dev",
+            "--cf-domain",
+            "pin.example.net",
+            // Default order would be Worker → CF; the pin flips it.
+            "--pinned-upstream",
+            "cfproxy,cfworker,tcp",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            "kws2.pin.example.net:443",
+            "kws2.pin.example.net:443",
+            "worker-pin.example.dev:443",
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_ladder_with_no_working_tier_drops_the_connection() {
+    // `mtproto` pinned but no --mtproto-proxy configured: nothing outbound
+    // may be attempted, and the unlisted tiers (CF, TCP) must not rescue the
+    // connection — pinning is explicit opt-in.  The probe listens for a short
+    // window rather than awaiting a shared fixture, which would block for its
+    // whole quiet period waiting for a first CONNECT that must never come.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let probe = tokio::spawn(async move {
+        match tokio::time::timeout(Duration::from_millis(500), listener.accept()).await {
+            Ok(Ok((mut stream, _))) => common::read_http_connect_request(&mut stream).await,
+            Ok(Err(e)) => panic!("accept failed: {e}"),
+            Err(_) => String::new(),
+        }
+    });
+
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "unused.example.net",
+            "--pinned-media-upstream",
+            "mtproto",
+        ],
+    );
+
+    run_proxy_once_for_dc(config, -2).await;
+
+    let request = common::await_task(probe).await;
+    assert!(
+        request.is_empty(),
+        "expected no outbound attempt, got {request:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_single_tier_pin_redials_the_worker_through_its_cooldown() {
+    // One failed Worker dial arms CF_WORKER_FAIL for the whole cooldown
+    // window. In the default ladder that only buys a faster step to the next
+    // rung, but a `cfworker`-only pin has no next rung: the second
+    // connection must dial the Worker again rather than drop every
+    // connection at "every pinned upstream failed" for the whole window.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &[
+                "--pinned-upstream",
+                "cfworker",
+                "--cf-worker-domain",
+                "worker-cooldown.example.dev",
+            ],
+        )
+    };
+
+    run_proxy_once(make_config()).await;
+    run_proxy_once(make_config()).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let worker_dials = requests
+        .iter()
+        .filter(|r| r.contains("worker-cooldown.example.dev"))
+        .count();
+    assert_eq!(
+        worker_dials, 2,
+        "both connections must dial the pinned Worker: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_cooldown_still_steps_over_when_a_later_tier_remains() {
+    // The last-resort bypass must not disarm the cooldown's purpose: with a
+    // later attemptable tier in the pin, the earlier rung stays a
+    // "prefer to step over" hint. Connection 1 dials the Worker (fails,
+    // arms the cooldown) then the upstream. Connection 2 skips the cooled
+    // Worker and goes straight to the upstream — its own last resort, so it
+    // is dialed even though connection 1 just armed its cooldown too.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &[
+                "--pinned-upstream",
+                "cfworker,mtproto",
+                "--cf-worker-domain",
+                "worker-hint.example.dev",
+                "--mtproto-proxy",
+                &format!("upstream-hint.example:443:{SECRET}"),
+            ],
+        )
+    };
+
+    run_proxy_once(make_config()).await;
+    run_proxy_once(make_config()).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            "worker-hint.example.dev:443",
+            "upstream-hint.example:443",
+            "upstream-hint.example:443",
+        ],
+        "cooldown must step over the Worker but force the last tier: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn cf_ip_does_not_cool_an_edge_for_an_http_proxy_error() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-domain",
+            "cfip.example.net",
+            "--cf-ip",
+            "203.0.113.10,198.51.100.20",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let targets = connect_targets(&requests);
+    assert_eq!(targets.len(), 5, "unexpected fallback shape: {targets:?}");
+    assert_eq!(
+        targets.iter().filter(|&&t| t == "203.0.113.10:443").count(),
+        2
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|&&t| t == "198.51.100.20:443")
+            .count(),
+        2
+    );
+    assert_eq!(targets.last(), Some(&"149.154.167.51:443"));
+    assert!(
+        targets
+            .iter()
+            .all(|target| !target.contains("cfip.example.net")),
+        "--cf-ip must never fall back to DNS: {targets:?}"
+    );
+}
+
+#[tokio::test]
+async fn cf_ip_bypasses_dns_and_tries_every_edge_for_the_worker() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-worker-domain",
+            "worker-cfip.example.dev",
+            "--cf-ip",
+            "203.0.113.11,198.51.100.21",
+        ],
+    );
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let targets = connect_targets(&requests);
+    assert_eq!(targets.len(), 3, "unexpected fallback shape: {targets:?}");
+    assert!(targets[..2].contains(&"203.0.113.11:443"));
+    assert!(targets[..2].contains(&"198.51.100.21:443"));
+    assert_eq!(targets.last(), Some(&"149.154.167.51:443"));
+    assert!(
+        targets
+            .iter()
+            .all(|target| !target.contains("worker-cfip.example.dev")),
+        "--cf-ip must never fall back to DNS: {targets:?}"
+    );
+}
+
+#[tokio::test]
+async fn cf_priority_tries_the_cf_proxy_before_the_direct_websocket() {
+    // With --dc-ip set the direct WS path is normally first; --cf-priority
+    // flips that, and the CF tier is then not retried after WS also fails.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-priority",
+            "--cf-domain",
+            "example.net",
+            "--dc-ip",
+            "2:149.154.167.220",
+            "--ws-connect-timeout",
+            "2",
+        ],
+    )
+    .with_defaults();
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            // CF first, its record twice...
+            "kws2.example.net:443",
+            "kws2.example.net:443",
+            // ...then the direct WS attempt on both Telegram hostnames...
+            "149.154.167.220:443",
+            "149.154.167.220:443",
+            // ...and finally the TCP fallback. CF is not tried a second time.
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cf_priority_tries_the_cf_worker_before_the_direct_websocket() {
+    // Regression for #93: --cf-priority used to cover only --cf-domain, so a
+    // Worker-only setup still paid the full direct-WS timeout on every
+    // connection before reaching the one tier that worked.
+    let (proxy_addr, proxy_task) = rejecting_http_proxy_requests().await;
+    // The domain is given in URL form on purpose: normalization happens once
+    // at startup now, so this is what keeps the routing path covered by it.
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--cf-priority",
+            "--cf-worker-domain",
+            "https://worker-priority.example.dev/apiws",
+            "--dc-ip",
+            "2:149.154.167.221",
+            "--ws-connect-timeout",
+            "2",
+        ],
+    )
+    .with_defaults();
+
+    run_proxy_once(config).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            // The Worker comes first...
+            "worker-priority.example.dev:443",
+            // ...then the direct WS attempt on both Telegram hostnames...
+            "149.154.167.221:443",
+            "149.154.167.221:443",
+            // ...and finally TCP. The Worker is not tried a second time.
+            "149.154.167.51:443",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn fronting_domain_is_applied_from_the_first_attempt() {
+    // #111: with --fronting-domain set, the first direct-WS ClientHello must
+    // already carry the fronted SNI — a reactive "front only after the real
+    // SNI times out" round-trip leaks telegram.org to a network that RSTs it
+    // on sight. Observable through the outbound proxy as the attempt count:
+    // the old reactive path dialed the DC IP with the real SNI and then once
+    // more fronted after the handshake stalled; fronted-first dials once, and
+    // the stalled connect also ends the hostname walk (#148).
+    const DC_IP: &str = "149.154.167.220";
+    let (proxy_addr, proxy_task) = stalling_http_proxy_requests(DC_IP).await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--dc-ip",
+            &format!("3:{DC_IP}"),
+            "--fronting-domain",
+            "front.example.org",
+            "--ws-connect-timeout",
+            "1",
+        ],
+    );
+
+    // DC 3 so this test's WS_FAIL cooldown state cannot collide with the
+    // sibling tests in this binary that share the process-wide maps.
+    run_proxy_once_for_dc(config, 3).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    let dc_dials = connect_targets(&requests)
+        .iter()
+        .filter(|target| **target == format!("{DC_IP}:443"))
+        .count();
+    assert_eq!(
+        dc_dials, 1,
+        "expected a single dial with no reactive retry, got {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dc_ip_that_timed_out_is_skipped_on_the_next_connection() {
+    // A DPI-blocked DC IP costs a full connect timeout per attempt. Paying
+    // that on every connection is what leaves Telegram sitting in
+    // "Connecting..." — so once an address times out, later connections go
+    // straight to the tiers that can still reach Telegram.
+    //
+    // Here every tier is dead, which is the case that must not turn into a
+    // one-hour lockout: with nothing else left the address is re-probed, so a
+    // cooldown set by a passing glitch can still be cleared by a connection
+    // that works.
+    const DEAD_IP: &str = "149.154.175.101";
+    let (proxy_addr, proxy_task) = stalling_http_proxy_requests(DEAD_IP).await;
+    let make_config = || {
+        proxy_config(
+            &format!("http://{proxy_addr}"),
+            &[
+                "--cf-worker-domain",
+                "worker-ipfail.example.dev",
+                "--dc-ip",
+                &format!("3:{DEAD_IP}"),
+                "--ws-connect-timeout",
+                "1",
+                "--ws-fail-probe-timeout",
+                "1",
+                "--cf-fail-cooldown",
+                "0",
+            ],
+        )
+    };
+
+    run_proxy_once_for_dc(make_config(), 3).await;
+    run_proxy_once_for_dc(make_config(), 3).await;
+
+    let requests = await_proxy_requests(proxy_task).await;
+    assert_eq!(
+        connect_targets(&requests),
+        [
+            // First connection probes the DC IP once — the second hostname
+            // shares the address, so its connect would stall the same way...
+            DEAD_IP,
+            // ...then falls back to the Worker and finally to TCP.
+            "worker-ipfail.example.dev:443",
+            "149.154.175.100:443",
+            // The second one goes to the Worker first, skipping the address...
+            "worker-ipfail.example.dev:443",
+            // ...and only re-probes it because nothing else was left, on the
+            // short cooldown clock rather than the full connect timeout.
+            DEAD_IP,
+            "149.154.175.100:443",
+        ]
+        .map(|target| if target == DEAD_IP {
+            format!("{DEAD_IP}:443")
+        } else {
+            target.to_string()
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_client_with_the_wrong_secret_is_dropped_without_dialling_out() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    let config = proxy_config(&format!("http://{proxy_addr}"), &[]);
+
+    let (mut client, handler) = start_proxy_connection(config).await;
+    // A handshake generated with a different secret must not parse.
+    let wrong_secret = hex::decode("ffeeddccbbaa99887766554433221100").unwrap();
+    let (handshake, _, _) =
+        generate_client_handshake(&wrong_secret, 2, ProtoTag::PaddedIntermediate);
+    client.write_all(&handshake).await.unwrap();
+    drop(client);
+
+    await_proxy_handler(handler).await;
+
+    // The scanner is drained silently: nothing was dialled outbound.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), proxy_task)
+            .await
+            .is_err(),
+        "a bad handshake must not trigger an outbound connection"
+    );
+}
+
+#[tokio::test]
+async fn inbound_faketls_handshake_is_accepted_and_routed() {
+    let domain = "example.com";
+    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &["--listen-faketls-domain", domain],
+    );
+    let secret = config.secret_bytes();
+
+    let (client, handler) = start_proxy_connection(config).await;
+    let (mut reader, mut writer) = tokio::io::split(client);
+
+    // Speak the client half of the FakeTLS camouflage: a signed ClientHello,
+    // then the real MTProto init inside an Application Data record.
+    let mut client_hello = build_faketls_client_hello(domain);
+    sign_faketls_client_hello(&mut client_hello, &secret);
+    writer.write_all(&client_hello).await.unwrap();
+
+    assert!(
+        drain_faketls_server_hello(&mut reader).await,
+        "proxy did not answer with a valid FakeTLS ServerHello"
+    );
+
+    let (handshake, _, _) = generate_client_handshake(&secret, 2, ProtoTag::PaddedIntermediate);
+    write_tls_appdata(&mut writer, &handshake).await.unwrap();
+    drop(writer);
+    drop(reader);
+
+    await_proxy_handler(handler).await;
+
+    // The camouflaged handshake was unwrapped and routed like any other.
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with("CONNECT 149.154.167.51:443 HTTP/1.1"));
+}
+
+/// Drive a FakeTLS client through the handshake and hand back the two halves,
+/// ready for the data phase.
+async fn faketls_client_handshake(
+    client: tokio::net::TcpStream,
+    domain: &str,
+    secret: &[u8],
+) -> (
+    tokio::io::ReadHalf<tokio::net::TcpStream>,
+    tokio::io::WriteHalf<tokio::net::TcpStream>,
+) {
+    let (mut reader, mut writer) = tokio::io::split(client);
+
+    let mut client_hello = build_faketls_client_hello(domain);
+    sign_faketls_client_hello(&mut client_hello, secret);
+    writer.write_all(&client_hello).await.unwrap();
+
+    assert!(
+        drain_faketls_server_hello(&mut reader).await,
+        "proxy did not answer with a valid FakeTLS ServerHello"
+    );
+
+    let (handshake, _, _) = generate_client_handshake(secret, 2, ProtoTag::PaddedIntermediate);
+    write_tls_appdata(&mut writer, &handshake).await.unwrap();
+
+    (reader, writer)
+}
+
+#[tokio::test]
+async fn inbound_faketls_relays_a_maximum_size_application_data_record() {
+    // A client read is a whole TLS record, and `read_tls_appdata` signals a
+    // record that does not fit the buffer as `Ok(0)` — indistinguishable from
+    // EOF to the bridge. A full-size record (and one spanning two records)
+    // must therefore still be relayed rather than silently ending the session.
+    let domain = "example.com";
+    let (upstream_addr, upstream_task) = common::counting_mtproto_acceptor().await;
+    let (proxy_addr, proxy_task) = common::tunneling_http_proxy(upstream_addr).await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--listen-faketls-domain",
+            domain,
+            "--mtproto-proxy",
+            &format!("{UPSTREAM_FULL_RECORD}:443:{SECRET}"),
+        ],
+    );
+    let secret = config.secret_bytes();
+
+    let (client, handler) = start_proxy_connection(config).await;
+    let (reader, mut writer) = faketls_client_handshake(client, domain, &secret).await;
+
+    // One maximum-size record, then a payload that spans two records.
+    let full_record = vec![0xa5u8; TLS_MAX_RECORD_PAYLOAD];
+    let spanning = vec![0x5au8; TLS_MAX_RECORD_PAYLOAD + 1024];
+    write_tls_appdata(&mut writer, &full_record).await.unwrap();
+    write_tls_appdata(&mut writer, &spanning).await.unwrap();
+    drop(writer);
+    drop(reader);
+
+    await_proxy_handler(handler).await;
+
+    let relayed = common::await_task(upstream_task).await;
+    assert_eq!(
+        relayed,
+        full_record.len() + spanning.len(),
+        "the proxy dropped part of the client's application data"
+    );
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with(&format!("CONNECT {UPSTREAM_FULL_RECORD}:443 HTTP/1.1")));
+}
+
+#[tokio::test]
+async fn inbound_faketls_tolerates_a_slightly_oversized_record() {
+    // Regression guard: `read_tls_appdata` reports any record larger than the
+    // read buffer as `Ok(0)`, so a client that emits a record above the RFC
+    // maximum used to have its session end silently. The client-read buffer
+    // keeps the same tolerance the inbound handshake already accepts.
+    let domain = "example.com";
+    let oversized_len = TLS_MAX_RECORD_PAYLOAD + 100;
+
+    let (upstream_addr, upstream_task) = common::counting_mtproto_acceptor().await;
+    let (proxy_addr, proxy_task) = common::tunneling_http_proxy(upstream_addr).await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &[
+            "--listen-faketls-domain",
+            domain,
+            "--mtproto-proxy",
+            &format!("{UPSTREAM_OVERSIZED}:443:{SECRET}"),
+        ],
+    );
+    let secret = config.secret_bytes();
+
+    let (client, handler) = start_proxy_connection(config).await;
+    let (reader, mut writer) = faketls_client_handshake(client, domain, &secret).await;
+
+    // Hand-rolled, because `write_tls_appdata` correctly chunks at the RFC
+    // maximum and would never emit an oversized record itself.
+    let mut record = vec![0x17, 0x03, 0x03];
+    record.extend_from_slice(&(oversized_len as u16).to_be_bytes());
+    record.extend(std::iter::repeat_n(0x33u8, oversized_len));
+    writer.write_all(&record).await.unwrap();
+    drop(writer);
+    drop(reader);
+
+    await_proxy_handler(handler).await;
+
+    let relayed = common::await_task(upstream_task).await;
+    assert_eq!(
+        relayed, oversized_len,
+        "an oversized record was treated as EOF instead of being relayed"
+    );
+    let request = await_proxy_request(proxy_task).await;
+    assert!(request.starts_with(&format!("CONNECT {UPSTREAM_OVERSIZED}:443 HTTP/1.1")));
+}
+
+#[tokio::test]
+async fn inbound_faketls_rejects_a_client_hello_for_another_hostname() {
+    let (proxy_addr, proxy_task) = rejecting_http_proxy().await;
+    let config = proxy_config(
+        &format!("http://{proxy_addr}"),
+        &["--listen-faketls-domain", "example.com"],
+    );
+    let secret = config.secret_bytes();
+
+    let (mut client, handler) = start_proxy_connection(config).await;
+
+    let mut client_hello = build_faketls_client_hello("not-the-configured.example");
+    sign_faketls_client_hello(&mut client_hello, &secret);
+    client.write_all(&client_hello).await.unwrap();
+    drop(client);
+
+    await_proxy_handler(handler).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), proxy_task)
+            .await
+            .is_err(),
+        "an SNI mismatch must not trigger an outbound connection"
+    );
+}
+
+#[tokio::test]
+async fn media_h2_shares_tls_across_clients_and_preserves_cf_ip_host() {
+    use cipher::StreamCipher;
+    use std::sync::Arc;
+    use tg_ws_proxy_rs::{pool::WsPool, runtime::Runtime};
+
+    let (addr, mut events, origin) = common::h2_echo_proxy().await;
+    let config = proxy_config(
+        &format!("http://{addr}"),
+        &[
+            "--cf-domain",
+            "h2.example",
+            "--cf-ip",
+            "192.0.2.170",
+            "--pinned-media-upstream",
+            "cfproxy",
+            "--danger-accept-invalid-certs",
+        ],
+    );
+    let runtime = Arc::new(
+        Runtime::new(config.outbound_connector().unwrap()).with_cf_ips(config.cf_ips.clone()),
+    );
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        runtime.clone(),
+    ));
+    for byte in [7, 8] {
+        let runtime = runtime.clone();
+        let pool = pool.clone();
+        let (mut client, handler) =
+            common::proxy_connection(config.clone(), move |socket, peer, config, _, _| {
+                tg_ws_proxy_rs::proxy::handle_client_with_runtime(
+                    socket, peer, config, pool, runtime,
+                )
+            })
+            .await;
+        let handler = tokio::spawn(handler);
+        let (handshake, mut enc, mut dec) =
+            generate_client_handshake(&hex::decode(SECRET).unwrap(), -2, ProtoTag::Intermediate);
+        client.write_all(&handshake).await.unwrap();
+        let mut packet = vec![40, 0, 0, 0];
+        packet.extend_from_slice(&[byte; 40]);
+        enc.apply_keystream(&mut packet);
+        client.write_all(&packet).await.unwrap();
+        let mut reply = [0; 44];
+        tokio::time::timeout(common::TASK_TIMEOUT, client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        dec.apply_keystream(&mut reply);
+        assert_eq!(&reply[..4], &[40, 0, 0, 0]);
+        assert_eq!(&reply[4..], &[byte; 40]);
+        drop(client);
+        await_proxy_handler(handler).await;
+    }
+    let mut captured = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        captured.push(event);
+    }
+    assert_eq!(
+        captured.len(),
+        5,
+        "one CONNECT, one TLS handshake, one HEAD, two POSTs: {captured:?}"
+    );
+    assert!(captured[0].starts_with("CONNECT 192.0.2.170:443 "));
+    assert_eq!(captured[1], "SNI kws2.h2.example");
+    assert_eq!(
+        &captured[2..],
+        &[
+            "HEAD https://kws2.h2.example/api",
+            "POST https://kws2.h2.example/api",
+            "POST https://kws2.h2.example/api",
+        ]
+    );
+    drop(pool);
+    drop(runtime);
+    origin.abort();
+}
+
+#[tokio::test]
+async fn h2_failure_falls_back_to_ws_and_opt_out_skips_h2() {
+    for (dc, extra, expected, port) in [
+        (-2, vec![], 3, 443),
+        (-2, vec!["--no-h2"], 2, 443),
+        (2, vec![], 2, 443),
+        (-2, vec!["--cf-disable-tls"], 2, 80),
+    ] {
+        let (addr, task) = rejecting_http_proxy_requests().await;
+        let mut args = vec![
+            "--cf-domain",
+            "h2-fallback.example",
+            "--pinned-upstream",
+            "cfproxy",
+        ];
+        args.extend(extra);
+        let config = proxy_config(&format!("http://{addr}"), &args);
+        run_proxy_once_for_dc(config, dc).await;
+        let requests = await_proxy_requests(task).await;
+        assert_eq!(
+            connect_targets(&requests),
+            vec![format!("kws2.h2-fallback.example:{port}"); expected]
+        );
+    }
+}

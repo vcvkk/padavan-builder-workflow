@@ -7,12 +7,74 @@ on:
       - '*'
 
 jobs:
+  tgwsproxy:
+    name: Build tg-ws-proxy
+    runs-on: ubuntu-latest
+    defaults: { run: { shell: bash } }
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Check if enabled in build.config
+      id: check
+      run: |
+        if grep -q '^CONFIG_FIRMWARE_INCLUDE_TGWSPROXY=y' <(sed 's|\r$||' build.config); then
+          echo "enabled=1" >> $GITHUB_OUTPUT
+        else
+          echo "enabled=0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Install Rust and zig
+      if: steps.check.outputs.enabled == '1'
+      run: |
+        rustup toolchain install "$NIGHTLY" --profile minimal -c rust-src
+        python3 -m venv "$RUNNER_TEMP/zig"
+        "$RUNNER_TEMP/zig/bin/pip" install -q ziglang==0.17.1 cargo-zigbuild==0.24.1
+        echo "$RUNNER_TEMP/zig/bin" >> $GITHUB_PATH
+      env:
+        NIGHTLY: nightly-2026-11-16
+
+    - name: Test
+      if: steps.check.outputs.enabled == '1'
+      working-directory: tg-ws-proxy-rs
+      run: cargo test --locked
+
+    # MT7620/MT7621/MT7628 are all little-endian MIPS32r2 without an FPU:
+    # one static soft-float binary serves every target this builder supports.
+    - name: Build for mipsel
+      if: steps.check.outputs.enabled == '1'
+      working-directory: tg-ws-proxy-rs
+      env:
+        CARGO_PROFILE_RELEASE_OPT_LEVEL: s
+        CARGO_PROFILE_RELEASE_PANIC: abort
+      run: |
+        cargo +nightly-2026-11-16 zigbuild --locked --release \
+          -Z build-std=std,panic_abort --target mipsel-unknown-linux-musl
+        ls -l target/mipsel-unknown-linux-musl/release/tg-ws-proxy
+
+    - name: Upload binary
+      if: steps.check.outputs.enabled == '1'
+      uses: actions/upload-artifact@v4
+      with:
+        name: tg-ws-proxy-mipsel
+        retention-days: 1
+        path: tg-ws-proxy-rs/target/mipsel-unknown-linux-musl/release/tg-ws-proxy
+
   build:
+    needs: tgwsproxy
     runs-on: ubuntu-latest
     container: registry.gitlab.com/hadzhioglu/padavan-ng
     defaults: { run: { shell: bash } }
     steps:
     - uses: actions/checkout@v4
+
+    - name: Download tg-ws-proxy
+      if: needs.tgwsproxy.outputs.enabled == '1'
+      uses: actions/download-artifact@v4
+      with:
+        name: tg-ws-proxy-mipsel
+        path: tgwsproxy/bin
 
     - name: Get variables
       run: |
