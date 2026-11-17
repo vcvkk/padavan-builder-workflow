@@ -7,6 +7,11 @@
 #   restart  stop, then start
 #   reload   called after every firewall rebuild: reinstall the rules,
 #            starting the proxy first if it is enabled but not running
+#   status   diagnostics: process, listener, redirect counters, TLS to the
+#            Telegram WebSocket endpoints, recent log lines
+#
+# The redirect is only installed while the proxy listens: if it fails to
+# start or crashes, Telegram goes direct instead of into a closed port.
 #
 # nvram: tgwsp_enable 0|1, tgwsp_ipv6 0|1 (refuse Telegram over IPv6 so apps
 # fall back to the redirected IPv4), tgwsp_log 0|1, tgwsp_args (extra
@@ -84,6 +89,10 @@ fw_add() {
 	fi
 }
 
+listening() {
+	netstat -ltn 2>/dev/null | grep -q ":$TPORT "
+}
+
 start() {
 	enabled || return 0
 	[ -x "$BIN" ] || { log "$BIN is missing"; return 1; }
@@ -99,29 +108,71 @@ start() {
 --transparent-enabled --transparent-host $ip --transparent-port $TPORT \
 --pool-size 2 $(nvram get tgwsp_args)"
 
+	# Fail open: the redirect exists only while the proxy listens, so a proxy
+	# that cannot start or crashes leaves Telegram going direct, not dead.
 	(
-		trap 'exit 0' TERM
+		trap 'fw_del; exit 0' TERM
 		export RUST_LOG=$level
 		while :; do
 			# shellcheck disable=SC2086
-			"$BIN" $args 2>&1 | logger -t "$TAG"
-			sleep 5
-			log "restarting after exit"
+			"$BIN" $args 2>&1 | logger -t "$TAG" &
+			i=0
+			while [ $i -lt 15 ] && ! listening; do
+				sleep 1
+				i=$((i + 1))
+			done
+			if listening; then
+				fw_add && log "started: Telegram on $(lan_if) is proxied transparently"
+			else
+				log "proxy is not listening on $TPORT; Telegram goes direct"
+			fi
+			wait
+			fw_del
+			log "proxy exited; Telegram goes direct until it restarts in 10 s"
+			sleep 10
 		done
 	) </dev/null >/dev/null 2>&1 &
 	echo $! > "$PIDFILE"
-
-	fw_add && log "started: Telegram on $(lan_if) is proxied transparently"
 }
 
 stop() {
-	fw_del
 	if [ -f "$PIDFILE" ]; then
 		kill "$(cat "$PIDFILE")" 2>/dev/null
 		rm -f "$PIDFILE"
 	fi
 	killall -q tg-ws-proxy 2>/dev/null
+	fw_del
 	return 0
+}
+
+# Run "$@" for at most $1 seconds; its output goes to stdout.
+with_timeout() {
+	t=$1
+	shift
+	"$@" &
+	p=$!
+	while [ "$t" -gt 0 ] && kill -0 $p 2>/dev/null; do
+		sleep 1
+		t=$((t - 1))
+	done
+	kill $p 2>/dev/null
+	wait $p 2>/dev/null
+}
+
+status() {
+	echo "enabled=$(nvram get tgwsp_enable) supervisor=$(running && echo up || echo down) listener:$TPORT=$(listening && echo up || echo down)"
+	echo "binary: $("$BIN" --version 2>&1 | head -n 1)"
+	iptables -t nat -vnL $CHAIN 2>/dev/null |
+		awk 'NR > 2 { p += $1 } END { print "redirected connections since start: " p + 0 }'
+	if command -v openssl >/dev/null 2>&1; then
+		for h in kws2.web.telegram.org kws4.web.telegram.org; do
+			r=$(with_timeout 8 openssl s_client -connect "$h:443" -servername "$h" </dev/null 2>&1 |
+				grep -c "Server certificate")
+			echo "TLS to $h: $([ "${r:-0}" -gt 0 ] && echo ok || echo FAILED)"
+		done
+	fi
+	echo "--- last log lines:"
+	grep "$TAG" /tmp/syslog.log 2>/dev/null | tail -n 20
 }
 
 case "$1" in
@@ -129,13 +180,15 @@ start) start ;;
 stop) stop ;;
 restart) stop; start ;;
 reload)
+	# After a firewall rebuild, which drops the nat rules.
 	if ! enabled; then
 		running && stop
-	elif running; then
-		fw_add
-	else
+	elif ! running; then
 		start
+	elif listening; then
+		fw_add
 	fi
 	;;
-*) echo "Usage: $0 {start|stop|restart|reload}"; exit 1 ;;
+status) status ;;
+*) echo "Usage: $0 {start|stop|restart|reload|status}"; exit 1 ;;
 esac
