@@ -28,6 +28,10 @@ default-members = ["."]
 name = "tg-ws-proxy"
 path = "src/main.rs"
 
+[features]
+default = ["env-filter"]
+env-filter = ["tracing-subscriber/env-filter"]
+
 [dependencies]
 # Multiplexed Cloudflare media requests.
 h2 = "0.4"
@@ -94,7 +98,14 @@ libc = "0.2"
 
 # Structured logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# env-filter (RUST_LOG directives) pulls in a regex engine; routers build
+# with --no-default-features and get a plain level filter instead.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "std",
+    "ansi",
+    "smallvec",
+] }
 
 # Async stream utilities (SinkExt, StreamExt)
 futures-util = "0.3"

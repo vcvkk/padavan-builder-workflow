@@ -91,15 +91,17 @@ start() {
 
 	ip="$(lan_ip)"
 	sec="$(secret)"
-	verbosity="-q"
-	[ "$(nvram get tgwsp_log)" = "1" ] && verbosity=""
+	# Warnings and errors always reach syslog; every connection only on request.
+	level=warn
+	[ "$(nvram get tgwsp_log)" = "1" ] && level=info
 	# Word splitting of tgwsp_args is intended: it holds extra flags.
 	args="--host $ip --port $MPORT --link-ip $ip --secret $sec \
 --transparent-enabled --transparent-host $ip --transparent-port $TPORT \
---pool-size 2 $verbosity $(nvram get tgwsp_args)"
+--pool-size 2 $(nvram get tgwsp_args)"
 
 	(
 		trap 'exit 0' TERM
+		export RUST_LOG=$level
 		while :; do
 			# shellcheck disable=SC2086
 			"$BIN" $args 2>&1 | logger -t "$TAG"

@@ -43,3 +43,11 @@ Code: `src/inbound/transparent.rs` (+ tests), a `Reject::Splice` outcome in
 See `../tgwsproxy/padavan/`: `tgwsproxy.sh` (service + iptables rules),
 `integrate.sh` (wires it into padavan-ng: rc, httpd, web UI), built by
 `../.github/workflows/build.yml` for `mipsel-unknown-linux-musl`.
+
+## Size for 8 MB routers
+
+`env-filter` (RUST_LOG directives, pulls in a regex engine) is now a default
+feature. Router builds use `--no-default-features`, where `RUST_LOG` may
+still name a single level (`warn`, `info`, ...), plus
+`-Z build-std-features=optimize_for_size`: 1.19 MB → 0.94 MB xz-compressed
+for mipsel.

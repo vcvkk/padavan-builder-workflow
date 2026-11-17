@@ -1,0 +1,24 @@
+### ALT6: multisplit seqovl 681
+### converted from Flowseal/zapret-discord-youtube: general (ALT6).bat
+### All arguments: https://github.com/bol-van/zapret/blob/master/docs/readme.md
+
+--filter-udp=443 --dpi-desync=fake --dpi-desync-repeats=6 --dpi-desync-fake-quic=/usr/share/zapret/fake/quic_initial_www_google_com.bin <HOSTLIST_NOAUTO>
+
+--new --filter-udp=19294-19344,50000-50100 --filter-l7=discord,stun --dpi-desync=fake --dpi-desync-fake-discord=/usr/share/zapret/fake/ACTIVE_DISCORD_UDP.bin --dpi-desync-fake-stun=/usr/share/zapret/fake/ACTIVE_DISCORD_UDP.bin --dpi-desync-repeats=6
+
+--new --filter-tcp=2053,2083,2087,2096,8443 --hostlist-domains=discord.media --dpi-desync=multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=/usr/share/zapret/fake/tls_clienthello_www_google_com.bin
+
+--new --filter-tcp=443 --hostlist-domains=yt3.ggpht.com,yt4.ggpht.com,yt3.googleusercontent.com,googlevideo.com,jnn-pa.googleapis.com,stable.dl2.discordapp.net,wide-youtube.l.google.com,youtube-nocookie.com,youtube-ui.l.google.com,youtube.com,youtubeembeddedplayer.googleapis.com,youtubekids.com,youtube.googleapis.com,youtubei.googleapis.com,youtu.be,yt-video-upload.l.google.com,ytimg.com,ytimg.l.google.com,play.google.com,fonts.googleapis.com,www.gstatic.com,google.ru --ip-id=zero --dpi-desync=multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=/usr/share/zapret/fake/tls_clienthello_www_google_com.bin
+
+--new --filter-tcp=80,443 --dpi-desync=multisplit --dpi-desync-split-seqovl=681 --dpi-desync-split-pos=1 --dpi-desync-split-seqovl-pattern=/usr/share/zapret/fake/tls_clienthello_www_google_com.bin <HOSTLIST>
+
+### Telegram calls: STUN to Telegram relays (UDP 1400; 590-1400 and
+### 3478-3481 seen on some ISPs). P2P calls use random high ports: either set
+### Telegram > Privacy > Calls > Peer-to-peer to "Nobody", or uncomment the
+### wide range below (costs CPU on busy UDP traffic such as torrents).
+--new --filter-udp=590-1400,3478-3481
+--filter-l7=stun --dpi-desync=fake --dpi-desync-fake-stun=/usr/share/zapret/fake/stun.bin
+--dpi-desync-repeats=6 --dpi-desync-cutoff=n3
+#--new --filter-udp=20000-65535
+#--filter-l7=stun --dpi-desync=fake --dpi-desync-fake-stun=/usr/share/zapret/fake/stun.bin
+#--dpi-desync-repeats=6 --dpi-desync-cutoff=n3

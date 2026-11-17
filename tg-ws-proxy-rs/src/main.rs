@@ -63,8 +63,21 @@ fn init_logging(config: &Config) {
         "info"
     };
 
-    let env_filter =
+    #[cfg(feature = "env-filter")]
+    let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.into());
+    // Without env-filter (router builds) RUST_LOG may still name one level.
+    #[cfg(not(feature = "env-filter"))]
+    let filter: tracing_subscriber::filter::LevelFilter = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|level| level.parse().ok())
+        .unwrap_or_else(|| log_level.parse().expect("built-in level"));
+
+    let builder = tracing_subscriber::fmt();
+    #[cfg(feature = "env-filter")]
+    let builder = builder.with_env_filter(filter);
+    #[cfg(not(feature = "env-filter"))]
+    let builder = builder.with_max_level(filter);
 
     if let Some(ref path) = config.log_file {
         // File output: always disable ANSI color codes in log files.
@@ -73,20 +86,13 @@ fn init_logging(config: &Config) {
             .append(true)
             .open(path)
             .unwrap_or_else(|e| panic!("cannot open log file '{}': {}", path, e));
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_ansi(false)
-            .with_writer(file)
-            .init();
+        builder.with_ansi(false).with_writer(file).init();
     } else {
         // Console output: ANSI color codes are not rendered correctly on
         // Windows consoles that lack Virtual Terminal Processing support, so
         // disable them there.  Also disable when stderr is not a terminal
         // (e.g. output is piped or redirected).
         let use_ansi = std::io::stderr().is_terminal() && !cfg!(windows);
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_ansi(use_ansi)
-            .init();
+        builder.with_ansi(use_ansi).init();
     }
 }
