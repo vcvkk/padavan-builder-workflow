@@ -1,0 +1,24 @@
+                                                    <tr>
+                                                        <th><#ZapretAutotest#>:</th>
+                                                        <td>
+                                                            <input type="button" class="btn btn-info" value="<#ZapretAutotest_run#>" onclick="zapret_autotest('zapret-autotest.sh');"/>
+                                                            <input type="button" class="btn" value="<#ZapretAutotest_status#>" onclick="zapret_autotest('zapret-autotest.sh status');"/>
+                                                            <pre id="zapret_autotest_out" style="display:none; margin-top:6px; max-height:320px; overflow:auto; font-size:11px; white-space:pre-wrap;"></pre>
+                                                            <script>
+                                                            function zapret_autotest(cmd){
+                                                                if (typeof login_safe == 'function' && !login_safe())
+                                                                    return;
+                                                                $j.post('/apply.cgi', {
+                                                                    'action_mode': ' SystemCmd ',
+                                                                    'current_page': 'console_response.asp',
+                                                                    'next_page': 'console_response.asp',
+                                                                    'SystemCmd': cmd
+                                                                }, function(){
+                                                                    $j.get('/console_response.asp', function(data){
+                                                                        $j('#zapret_autotest_out').text(data).show();
+                                                                    });
+                                                                });
+                                                            }
+                                                            </script>
+                                                        </td>
+                                                    </tr>

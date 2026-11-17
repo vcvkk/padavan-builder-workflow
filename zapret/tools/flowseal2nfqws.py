@@ -29,17 +29,19 @@ FAKE = "/usr/share/zapret/fake/"
 
 # (output file, Flowseal .bat, label shown in the web UI)
 PROFILES = [
+    # Operators after the profile name are where community reports say it
+    # worked (Flowseal issues/discussions, 2025-2026); a hint, not a promise.
     ("strategy", "general.bat", "general"),
-    ("strategy0", "general (ALT).bat", "ALT: fake+fakedsplit, ts"),
-    ("strategy1", "general (ALT2).bat", "ALT2: multisplit seqovl 652"),
-    ("strategy2", "general (ALT3).bat", "ALT3: fake+hostfakesplit ya.ru"),
-    ("strategy3", "general (ALT4).bat", "ALT4: fake+multisplit, badseq"),
-    ("strategy4", "general (ALT6).bat", "ALT6: multisplit seqovl 681"),
+    ("strategy0", "general (ALT).bat", "ALT: fake+fakedsplit"),
+    ("strategy1", "general (ALT2).bat", "ALT2: multisplit 652 — Дом.ру, Ростелеком"),
+    ("strategy2", "general (ALT3).bat", "ALT3: hostfakesplit ya.ru — Билайн"),
+    ("strategy3", "general (ALT4).bat", "ALT4: fake+multisplit badseq"),
+    ("strategy4", "general (ALT6).bat", "ALT6: multisplit 681 — МТС"),
     ("strategy5", "general (ALT7).bat", "ALT7: multisplit sniext"),
     ("strategy6", "general (ALT9).bat", "ALT9: hostfakesplit ozon.ru"),
-    ("strategy7", "general (ALT11).bat", "ALT11: fake+multisplit 664, ts"),
+    ("strategy7", "general (ALT11).bat", "ALT11: fake+multisplit 664"),
     ("strategy8", "general (FAKE TLS AUTO ALT2).bat", "FAKE TLS AUTO ALT2"),
-    ("strategy9", "general (SIMPLE FAKE).bat", "SIMPLE FAKE: fake, ts"),
+    ("strategy9", "general (SIMPLE FAKE).bat", "SIMPLE FAKE — Ростелеком, Билайн"),
 ]
 
 TELEGRAM_CALLS = f"""
@@ -134,9 +136,9 @@ def main() -> None:
     (dest / "fake").mkdir(parents=True, exist_ok=True)
     labels = []
     for name, bat, label in PROFILES:
-        (dest / name).write_text(convert(root, bat, label))
+        (dest / name).write_text(convert(root, bat, label), encoding="utf-8")
         labels.append(f"{name}\t{label}")
-    (dest / "labels.tsv").write_text("\n".join(labels) + "\n")
+    (dest / "labels.tsv").write_text("\n".join(labels) + "\n", encoding="utf-8")
     for b in sorted(convert.bins):
         src = root / "bin" / b
         if not src.exists():

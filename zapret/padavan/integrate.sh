@@ -9,6 +9,8 @@
 # - strategy + strategy0..9 replaced by profiles converted from
 #   Flowseal/zapret-discord-youtube (see ../tools/flowseal2nfqws.py), each
 #   with a Telegram calls block; their names appear in the web UI.
+# - zapret-autotest.sh: tries every profile against YouTube/Discord from the
+#   router itself and keeps the best one, run from a button on the page.
 
 set -euo pipefail
 
@@ -38,6 +40,12 @@ SHARE="$N/zapretsh-main/zapret/usr/share/zapret"
 cp "$STRAT"/strategy "$STRAT"/strategy[0-9] "$SHARE/"
 cp "$STRAT"/fake/*.bin "$SHARE/fake/"
 
+cp "$HERE/zapret-autotest.sh" "$N/zapretsh-main/zapret/usr/bin/zapret-autotest.sh"
+ROMFS_LINE='$(ROMFSINST) -p +x $(SRC_NAME_SH)/zapret/usr/bin/zapret.sh /usr/bin/zapret.sh'
+grep -qxF "$(printf '\t')$ROMFS_LINE" "$N/Makefile" || die "nfqws Makefile romfs line not found"
+sed -i "/zapret\/usr\/bin\/zapret.sh \/usr\/bin\/zapret.sh\$/a\\
+\t\$(ROMFSINST) -p +x \$(SRC_NAME_SH)/zapret/usr/bin/zapret-autotest.sh /usr/bin/zapret-autotest.sh" "$N/Makefile"
+
 # Profile names in the strategy selector.
 ASP="$TRUNK/user/www/n56u_ribbon_fixed/Advanced_Services_Content.asp"
 while IFS=$'\t' read -r file label; do
@@ -50,5 +58,28 @@ while IFS=$'\t' read -r file label; do
 		sed -i "s|><#ZapretStrategyProfile#> #$n</option>|><#ZapretStrategyProfile#> #$n: $label</option>|" "$ASP"
 	fi
 done < "$STRAT/labels.tsv"
+
+# Autotest buttons above the log selector (anchor: the row holding ZapretLog).
+grep -c '<th><#ZapretLog#>:</th>' "$ASP" | grep -qx 1 || die "ZapretLog row not found"
+SNIP="$HERE/autotest.asp.html" awk '
+	BEGIN { while ((getline l < ENVIRON["SNIP"]) > 0) snip = snip l "\n" }
+	NR > 1 && index($0, "<th><#ZapretLog#>:</th>") { printf "%s", snip }
+	NR > 1 { print prev }
+	{ prev = $0 }
+	END { print prev }' "$ASP" > "$ASP.tmp" && mv "$ASP.tmp" "$ASP"
+
+add_strings() {
+	local dict=$1
+	shift
+	[[ -z $(tail -c1 "$dict") ]] || echo >> "$dict"
+	printf '%s\n' "$@" >> "$dict"
+}
+D="$TRUNK/user/www/dict"
+add_strings "$D/EN.footer" "ZapretAutotest=Pick a profile for this ISP" \
+	"ZapretAutotest_run=Run (3-4 min)" "ZapretAutotest_status=Result"
+add_strings "$D/RU.dict" "ZapretAutotest=Подобрать профиль под провайдера" \
+	"ZapretAutotest_run=Подобрать (3-4 мин)" "ZapretAutotest_status=Результат"
+add_strings "$D/UK.dict" "ZapretAutotest=Підібрати профіль під провайдера" \
+	"ZapretAutotest_run=Підібрати (3-4 хв)" "ZapretAutotest_status=Результат"
 
 echo "zapret: nfqws $VER and $(wc -l < "$STRAT/labels.tsv") profiles integrated"

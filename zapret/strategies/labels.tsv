@@ -1,11 +1,11 @@
 strategy	general
-strategy0	ALT: fake+fakedsplit, ts
-strategy1	ALT2: multisplit seqovl 652
-strategy2	ALT3: fake+hostfakesplit ya.ru
-strategy3	ALT4: fake+multisplit, badseq
-strategy4	ALT6: multisplit seqovl 681
+strategy0	ALT: fake+fakedsplit
+strategy1	ALT2: multisplit 652 — Дом.ру, Ростелеком
+strategy2	ALT3: hostfakesplit ya.ru — Билайн
+strategy3	ALT4: fake+multisplit badseq
+strategy4	ALT6: multisplit 681 — МТС
 strategy5	ALT7: multisplit sniext
 strategy6	ALT9: hostfakesplit ozon.ru
-strategy7	ALT11: fake+multisplit 664, ts
+strategy7	ALT11: fake+multisplit 664
 strategy8	FAKE TLS AUTO ALT2
-strategy9	SIMPLE FAKE: fake, ts
+strategy9	SIMPLE FAKE — Ростелеком, Билайн
